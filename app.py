@@ -1,11 +1,12 @@
 """
-選股雷達 — Python Flask 後端 v5
-台股資料來源：twstock 套件（支援上市+上櫃）
+選股雷達 — Python Flask 後端 v6
+不依賴 twstock 代碼清單，直接同時試查 TSE + TPEx
+確保上市/上櫃都能查到
 """
 
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-import twstock
+import requests
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
@@ -18,212 +19,247 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 app = Flask(__name__)
 CORS(app)
 
-# ===== 工具函式 =====
+MIS_URL  = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
+TSE_HIST = "https://www.twse.com.tw/exchangeReport/STOCK_DAY"
+TSE_PE   = "https://www.twse.com.tw/exchangeReport/BWIBBU_d"
+OTC_HIST = "https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php"
+OTC_PE   = "https://www.tpex.org.tw/web/stock/aftertrading/peratio_analysis/pera_result.php"
 
-def safe_val(val, decimals=2):
-    if val is None:
+BASE_HDR = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+TSE_HDR  = {**BASE_HDR, "Referer": "https://mis.twse.com.tw/"}
+OTC_HDR  = {**BASE_HDR, "Referer": "https://www.tpex.org.tw/"}
+
+# ===== 工具 =====
+
+def safe(v, d=2):
+    if v is None or str(v).strip() in ("", "-", "--", "N/A"):
         return None
     try:
-        f = float(val)
-        return None if (np.isnan(f) or np.isinf(f)) else round(f, decimals)
+        f = float(str(v).replace(",", "").replace("+", ""))
+        return None if (np.isnan(f) or np.isinf(f)) else round(f, d)
     except Exception:
         return None
+
+# ===== 即時報價（同時試上市/上櫃）=====
+
+def get_realtime(code):
+    """回傳 (market_type, realtime_dict)，market_type = 'tse' 或 'otc'"""
+    for prefix in ["tse", "otc"]:
+        try:
+            r = requests.get(MIS_URL,
+                params={"ex_ch": f"{prefix}_{code}.tw", "json": 1, "delay": 0},
+                headers=TSE_HDR, timeout=8, verify=False)
+            msg = r.json().get("msgArray", [])
+            if msg and msg[0].get("n"):
+                s = msg[0]
+                # 成交價優先，收盤後用昨收
+                price = safe(s.get("z")) or safe(s.get("y"))
+                prev  = safe(s.get("y"))
+                chg   = round((price-prev)/prev*100,2) if price and prev and prev!=0 else None
+                return prefix, {
+                    "name": s.get("n", code), "price": price, "prev_close": prev,
+                    "change": chg, "open": safe(s.get("o")),
+                    "high": safe(s.get("h")), "low": safe(s.get("l")),
+                    "volume": safe(s.get("v"), 0),
+                }
+        except Exception as e:
+            print(f"[MIS {prefix}] {code}: {e}")
+        time.sleep(0.15)
+    return None, None
+
+# ===== 上市歷史 =====
+
+def tse_history(code, months=5):
+    ac, ah, al = [], [], []
+    for i in range(months):
+        d = (datetime.now()-timedelta(days=30*i)).strftime("%Y%m01")
+        try:
+            r = requests.get(TSE_HIST,
+                params={"response":"json","date":d,"stockNo":code},
+                headers=TSE_HDR, timeout=8, verify=False)
+            data = r.json()
+            if data.get("stat") == "OK":
+                for row in (data.get("data") or []):
+                    c=safe(row[6]); h=safe(row[4]); l=safe(row[5])
+                    if c: ac.append(c); ah.append(h or c); al.append(l or c)
+            time.sleep(0.3)
+        except Exception as e:
+            print(f"[TSE hist] {code} {d}: {e}")
+    ac.reverse(); ah.reverse(); al.reverse()
+    return ac, ah, al
+
+# ===== 上櫃歷史 =====
+
+def otc_history(code, months=5):
+    ac, ah, al = [], [], []
+    for i in range(months):
+        t = datetime.now()-timedelta(days=30*i)
+        d = f"{t.year-1911}/{t.month:02d}"
+        try:
+            r = requests.get(OTC_HIST,
+                params={"d":d,"stkno":code,"s":"0,asc,0","l":"zh-tw","o":"json"},
+                headers=OTC_HDR, timeout=8, verify=False)
+            rows = r.json().get("aaData") or r.json().get("data") or []
+            for row in rows:
+                c=safe(row[6]); h=safe(row[4]); l=safe(row[5])
+                if c: ac.append(c); ah.append(h or c); al.append(l or c)
+            time.sleep(0.3)
+        except Exception as e:
+            print(f"[OTC hist] {code} {d}: {e}")
+    ac.reverse(); ah.reverse(); al.reverse()
+    return ac, ah, al
+
+# ===== 本益比/殖利率 =====
+
+def tse_pe(code, months=5):
+    for i in range(months):
+        d = (datetime.now()-timedelta(days=30*i)).strftime("%Y%m01")
+        try:
+            r = requests.get(TSE_PE,
+                params={"response":"json","date":d,"stockNo":code},
+                headers=TSE_HDR, timeout=8, verify=False)
+            data = r.json()
+            if data.get("stat") == "OK":
+                for row in reversed(data.get("data") or []):
+                    pe=safe(row[3]); yld=safe(row[1]); pb=safe(row[5])
+                    if pe or yld: return pe, yld, pb
+            time.sleep(0.25)
+        except Exception as e:
+            print(f"[TSE PE] {code}: {e}")
+    return None, None, None
+
+def otc_pe(code, months=5):
+    for i in range(months):
+        t = datetime.now()-timedelta(days=30*i)
+        d = f"{t.year-1911}/{t.month:02d}"
+        try:
+            r = requests.get(OTC_PE,
+                params={"d":d,"stkno":code,"l":"zh-tw","o":"json"},
+                headers=OTC_HDR, timeout=8, verify=False)
+            rows = r.json().get("aaData") or r.json().get("data") or []
+            for row in reversed(rows):
+                pe=safe(row[1]); yld=safe(row[3]); pb=safe(row[4])
+                if pe or yld: return pe, yld, pb
+            time.sleep(0.25)
+        except Exception as e:
+            print(f"[OTC PE] {code}: {e}")
+    return None, None, None
 
 # ===== 技術指標 =====
 
-def calc_rsi(prices, period=14):
-    if len(prices) < period + 1:
-        return None
-    s = pd.Series(prices)
-    d = s.diff()
-    gain = d.clip(lower=0).rolling(period).mean()
-    loss = -d.clip(upper=0).rolling(period).mean()
-    rs = gain / loss
-    return safe_val((100 - 100 / (1 + rs)).iloc[-1], 1)
+def rsi(p, n=14):
+    if len(p)<n+1: return None
+    s=pd.Series(p); d=s.diff()
+    g=d.clip(lower=0).rolling(n).mean(); l=-d.clip(upper=0).rolling(n).mean()
+    return safe((100-100/(1+g/l)).iloc[-1],1)
 
-def calc_macd(prices):
-    if len(prices) < 26:
-        return "unknown"
-    s = pd.Series(prices)
-    macd   = s.ewm(span=12, adjust=False).mean() - s.ewm(span=26, adjust=False).mean()
-    signal = macd.ewm(span=9, adjust=False).mean()
-    hist   = macd - signal
-    if macd.iloc[-2] < signal.iloc[-2] and macd.iloc[-1] > signal.iloc[-1]:
-        return "bullish"
-    if macd.iloc[-2] > signal.iloc[-2] and macd.iloc[-1] < signal.iloc[-1]:
-        return "bearish"
-    return "positive" if hist.iloc[-1] > 0 else "negative"
+def macd(p):
+    if len(p)<26: return "unknown"
+    s=pd.Series(p)
+    ml=s.ewm(span=12,adjust=False).mean()-s.ewm(span=26,adjust=False).mean()
+    sg=ml.ewm(span=9,adjust=False).mean(); ht=ml-sg
+    if ml.iloc[-2]<sg.iloc[-2] and ml.iloc[-1]>sg.iloc[-1]: return "bullish"
+    if ml.iloc[-2]>sg.iloc[-2] and ml.iloc[-1]<sg.iloc[-1]: return "bearish"
+    return "positive" if ht.iloc[-1]>0 else "negative"
 
-def calc_kd(h, l, c, period=9):
-    if len(c) < period:
-        return None, None
-    lmin = pd.Series(l).rolling(period).min()
-    hmax = pd.Series(h).rolling(period).max()
-    diff = (hmax - lmin).replace(0, np.nan)
-    rsv  = (pd.Series(c) - lmin) / diff * 100
-    k = rsv.ewm(com=2, adjust=False).mean()
-    d = k.ewm(com=2, adjust=False).mean()
-    return safe_val(k.iloc[-1], 1), safe_val(d.iloc[-1], 1)
+def kd(h,l,c,n=9):
+    if len(c)<n: return None,None
+    lm=pd.Series(l).rolling(n).min(); hm=pd.Series(h).rolling(n).max()
+    rsv=(pd.Series(c)-lm)/(hm-lm).replace(0,np.nan)*100
+    k=rsv.ewm(com=2,adjust=False).mean(); d=k.ewm(com=2,adjust=False).mean()
+    return safe(k.iloc[-1],1), safe(d.iloc[-1],1)
 
-def get_ma_state(prices):
-    if len(prices) < 20:
-        return "unknown"
-    s = pd.Series(prices)
-    cur  = s.iloc[-1]
-    ma5  = s.rolling(5).mean().iloc[-1]
-    ma20 = s.rolling(20).mean().iloc[-1]
-    if len(prices) >= 60:
-        ma60 = s.rolling(60).mean().iloc[-1]
-        if cur > ma5 > ma20 > ma60:
-            return "all_above"
-    if ma5 > ma20 and cur > ma20:
-        return "golden_cross"
-    if cur > ma20:
-        return "above_ma20"
+def ma_state(p):
+    if len(p)<20: return "unknown"
+    s=pd.Series(p); cur=s.iloc[-1]
+    m5=s.rolling(5).mean().iloc[-1]; m20=s.rolling(20).mean().iloc[-1]
+    if len(p)>=60:
+        m60=s.rolling(60).mean().iloc[-1]
+        if cur>m5>m20>m60: return "all_above"
+    if m5>m20 and cur>m20: return "golden_cross"
+    if cur>m20: return "above_ma20"
     return "below_all"
 
-def gen_signals(pe, yield_pct, rsi, macd, ma_state):
-    s = []
-    if macd == "bullish":              s.append("MACD黃金交叉")
-    if ma_state == "all_above":        s.append("多頭排列")
-    elif ma_state == "golden_cross":   s.append("均線交叉")
-    if rsi and rsi < 30:               s.append("RSI超賣")
-    if yield_pct and yield_pct >= 4:   s.append("高殖利率")
-    if pe and pe < 12:                 s.append("低本益比")
-    if rsi and 50 < rsi < 70:          s.append("強勢區間")
+def signals(pe,yld,r,m,ms):
+    s=[]
+    if m=="bullish":      s.append("MACD黃金交叉")
+    if ms=="all_above":   s.append("多頭排列")
+    elif ms=="golden_cross": s.append("均線交叉")
+    if r and r<30:        s.append("RSI超賣")
+    if yld and yld>=4:    s.append("高殖利率")
+    if pe and pe<12:      s.append("低本益比")
+    if r and 50<r<70:     s.append("強勢區間")
     return s[:4]
 
-# ===== 取得股票資料（twstock）=====
+# ===== 核心查詢邏輯 =====
 
-def fetch_stock(code):
-    code = str(code).strip().upper().replace(".TW", "").replace(".TWO", "")
+def query(code):
+    code = code.strip().upper().replace(".TW","").replace(".TWO","")
 
-    # 確認股票是否存在（上市或上櫃）
-    stock_info = twstock.codes.get(code)
-    if not stock_info:
-        return None, f"找不到股票：{code}"
+    # 1. 即時報價（自動識別上市/上櫃）
+    mtype, rt = get_realtime(code)
 
-    stock_name = stock_info.name
-    market_type = "tse" if stock_info.market == "上市" else "otc"
+    # 2. 歷史資料（優先用即時判斷的市場，若兩者都沒有就都試）
+    cl, hl, ll = [], [], []
+    if mtype == "otc":
+        cl, hl, ll = otc_history(code)
+    elif mtype == "tse":
+        cl, hl, ll = tse_history(code)
+    else:
+        # 即時查不到時，兩個都試
+        cl, hl, ll = tse_history(code)
+        if not cl:
+            cl, hl, ll = otc_history(code)
+            if cl: mtype = "otc"
+        else:
+            mtype = "tse"
 
-    # 取得近 6 個月歷史資料
-    stock = twstock.Stock(code)
-    now = datetime.now()
-    start_year  = now.year
-    start_month = now.month - 5
-    if start_month <= 0:
-        start_month += 12
-        start_year -= 1
-    stock.fetch_from(start_year, start_month)
+    if not cl:
+        return None, f"找不到股票：{code}，請確認是否為台股上市/上櫃代號"
 
-    if not stock.price or len(stock.price) < 5:
-        return None, f"無法取得 {code} 的歷史資料"
+    # 3. 補充即時報價（若收盤後取不到）
+    if not rt:
+        price = cl[-1]; prev = cl[-2] if len(cl)>=2 else cl[-1]
+        chg   = round((price-prev)/prev*100,2) if prev else None
+        rt    = {"name": code, "price": price, "prev_close": prev, "change": chg,
+                 "open": None, "high": None, "low": None, "volume": None}
 
-    close_list = [safe_val(p) for p in stock.price if p]
-    high_list  = [safe_val(p) for p in stock.high  if p]
-    low_list   = [safe_val(p) for p in stock.low   if p]
+    # 4. 本益比殖利率
+    time.sleep(0.2)
+    pe, yld, pb = otc_pe(code) if mtype=="otc" else tse_pe(code)
 
-    price    = close_list[-1]
-    prev     = close_list[-2] if len(close_list) >= 2 else price
-    change   = round((price - prev) / prev * 100, 2) if prev and prev != 0 else None
-
-    # 即時報價（交易時間內）
-    try:
-        rt = twstock.realtime.get(code)
-        if rt and rt.get("success") and rt["realtime"].get("latest_trade_price"):
-            rt_price = safe_val(rt["realtime"]["latest_trade_price"])
-            if rt_price and rt_price > 0:
-                price  = rt_price
-                change = round((price - prev) / prev * 100, 2) if prev else change
-    except Exception:
-        pass
-
-    # 技術指標
-    rsi      = calc_rsi(close_list) if len(close_list) >= 15 else None
-    macd_sig = calc_macd(close_list) if len(close_list) >= 26 else "unknown"
-    k_val, d_val = calc_kd(high_list, low_list, close_list)
-    ma_state = get_ma_state(close_list)
-    high52   = max(high_list) if high_list else None
-    low52    = min(low_list)  if low_list  else None
-    recent30 = close_list[-30:]
-
-    # 本益比殖利率（twstock 目前不直接提供，用 TWSE/TPEx API 補）
-    pe, yield_pct, pb = fetch_pe_yield(code, market_type)
+    # 5. 技術指標
+    r_   = rsi(cl) if len(cl)>=15 else None
+    m_   = macd(cl) if len(cl)>=26 else "unknown"
+    k_,d_= kd(hl,ll,cl)
+    ms_  = ma_state(cl)
 
     return {
-        "code": code, "name": stock_name,
-        "market": "tw", "market_type": market_type,
-        "price": price, "prev_close": prev, "change": change,
-        "day_high": high_list[-1] if high_list else None,
-        "day_low":  low_list[-1]  if low_list  else None,
-        "week_52_high": high52, "week_52_low": low52,
-        "pe": pe, "pb": pb, "yield_pct": yield_pct,
+        "code": code, "name": rt["name"], "market": "tw", "market_type": mtype,
+        "price": rt["price"], "prev_close": rt.get("prev_close"), "change": rt.get("change"),
+        "day_high": rt.get("high"), "day_low": rt.get("low"),
+        "open": rt.get("open"), "volume": rt.get("volume"),
+        "week_52_high": max(hl) if hl else None, "week_52_low": min(ll) if ll else None,
+        "pe": pe, "pb": pb, "yield_pct": yld,
         "roe": None, "eps_growth": None, "gross": None, "debt": None, "cap": "large",
-        "rsi": rsi, "macd": macd_sig, "kd": k_val, "kd_d": d_val, "ma_state": ma_state,
+        "rsi": r_, "macd": m_, "kd": k_, "kd_d": d_, "ma_state": ms_,
         "foreign_days": None, "invest": None, "margin_pct": None,
-        "price_history": recent30,
-        "signals": gen_signals(pe, yield_pct, rsi, macd_sig, ma_state),
-        "sector": stock_info.group if stock_info else None,
-        "currency": "TWD", "updated_at": datetime.now().isoformat()
+        "price_history": cl[-30:],
+        "signals": signals(pe,yld,r_,m_,ms_),
+        "sector": None, "currency": "TWD", "updated_at": datetime.now().isoformat()
     }, None
 
-
-def fetch_pe_yield(code, market_type):
-    """補充抓取本益比與殖利率"""
-    import requests
-    HEADERS = {"User-Agent": "Mozilla/5.0", "Referer": "https://mis.twse.com.tw/"}
-    today = datetime.now()
-
-    if market_type == "tse":
-        url = "https://www.twse.com.tw/exchangeReport/BWIBBU_d"
-        for i in range(5):
-            d = (today - timedelta(days=30 * i)).strftime("%Y%m01")
-            try:
-                res = requests.get(url, params={"response": "json", "date": d, "stockNo": code},
-                                   headers=HEADERS, timeout=8, verify=False)
-                data = res.json()
-                if data.get("stat") == "OK":
-                    for row in reversed(data.get("data") or []):
-                        pe = safe_val(row[3]); yld = safe_val(row[1]); pb = safe_val(row[5])
-                        if pe or yld:
-                            return pe, yld, pb
-                time.sleep(0.3)
-            except Exception:
-                pass
-    else:
-        url = "https://www.tpex.org.tw/web/stock/aftertrading/peratio_analysis/pera_result.php"
-        for i in range(5):
-            target = today - timedelta(days=30 * i)
-            roc = target.year - 1911
-            d = f"{roc}/{target.month:02d}"
-            try:
-                res = requests.get(url, params={"d": d, "stkno": code, "l": "zh-tw", "o": "json"},
-                                   headers={**HEADERS, "Referer": "https://www.tpex.org.tw/"},
-                                   timeout=8, verify=False)
-                rows = res.json().get("aaData") or []
-                for row in reversed(rows):
-                    pe = safe_val(row[1]); yld = safe_val(row[3]); pb = safe_val(row[4])
-                    if pe or yld:
-                        return pe, yld, pb
-                time.sleep(0.3)
-            except Exception:
-                pass
-    return None, None, None
-
-
-# ===== API 端點 =====
+# ===== 路由 =====
 
 @app.route("/")
 def index():
-    return jsonify({"status": "ok", "message": "選股雷達後端 v5（twstock 引擎）",
-                    "time": datetime.now().isoformat()})
+    return jsonify({"status":"ok","message":"選股雷達 v6（上市+上櫃自動識別）","time":datetime.now().isoformat()})
 
 @app.route("/api/stock/<code>")
 def get_stock(code):
     try:
-        data, err = fetch_stock(code)
-        if err:
-            return jsonify({"error": err}), 404
+        data, err = query(code)
+        if err: return jsonify({"error": err}), 404
         return jsonify(data)
     except Exception as e:
         traceback.print_exc()
@@ -231,38 +267,29 @@ def get_stock(code):
 
 @app.route("/api/screen")
 def screen_stocks():
-    codes_param = request.args.get("codes", "")
-    if not codes_param:
-        return jsonify({"error": "請提供股票代號列表"}), 400
+    codes_param = request.args.get("codes","")
+    if not codes_param: return jsonify({"error":"請提供股票代號"}),400
     codes = [c.strip().replace(".TW","").replace(".TWO","").upper()
              for c in codes_param.split(",") if c.strip()]
-    if len(codes) > 30:
-        return jsonify({"error": "單次最多查詢 30 檔"}), 400
-
+    if len(codes)>30: return jsonify({"error":"單次最多 30 檔"}),400
     results, errors = [], []
     for code in codes:
         try:
-            data, err = fetch_stock(code)
-            if err or not data:
-                errors.append(code)
-                continue
+            data, err = query(code)
+            if err or not data: errors.append(code); continue
             results.append({
-                "code": data["code"], "name": data["name"], "market": "tw",
-                "price": data["price"], "change": data["change"],
-                "pe": data["pe"], "yield_pct": data["yield_pct"],
-                "roe": None, "gross": None, "debt": None,
-                "rsi": data["rsi"], "macd": data["macd"],
-                "kd": data["kd"], "ma_state": data["ma_state"],
-                "cap": "large", "foreign_days": None, "invest": None, "margin_pct": None,
-                "signals": data["signals"],
+                "code":data["code"],"name":data["name"],"market":"tw",
+                "price":data["price"],"change":data["change"],
+                "pe":data["pe"],"yield_pct":data["yield_pct"],
+                "roe":None,"gross":None,"debt":None,
+                "rsi":data["rsi"],"macd":data["macd"],"kd":data["kd"],"ma_state":data["ma_state"],
+                "cap":"large","foreign_days":None,"invest":None,"margin_pct":None,
+                "signals":data["signals"],
             })
             time.sleep(0.8)
         except Exception as e:
-            errors.append(code)
-            print(f"[ERROR] {code}: {e}")
-
-    return jsonify({"results": results, "total": len(results),
-                    "errors": errors, "updated_at": datetime.now().isoformat()})
+            errors.append(code); print(f"[ERR] {code}: {e}")
+    return jsonify({"results":results,"total":len(results),"errors":errors,"updated_at":datetime.now().isoformat()})
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
