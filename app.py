@@ -114,7 +114,11 @@ def otc_history(code, months=5):
     # 若 OpenAPI 查不到，退回舊版 API
     if not ac:
         ac, ah, al = otc_history_fallback(code, months)
+        return ac, ah, al
 
+    # OpenAPI 資料：每月由舊到新，各月間需要 reverse（先取的是最新月份）
+    # 目前 ac 的順序是：本月資料 + 上月資料 + ... (各月內部由舊到新)
+    # 只需整體 reverse 讓時間序由舊到新
     ac.reverse(); ah.reverse(); al.reverse()
     return ac, ah, al
 
