@@ -107,7 +107,7 @@ def otc_history(code, months=5):
                 if str(row.get("SecuritiesCompanyCode","")).strip() == code:
                     c=safe(row.get("Close")); h=safe(row.get("High")); l=safe(row.get("Low"))
                     if c: ac.append(c); ah.append(h or c); al.append(l or c)
-            time.sleep(0.3)
+            time.sleep(0.2)
         except Exception as e:
             print(f"[OTC OpenAPI hist] {code} {yyyymm}: {e}")
 
@@ -317,3 +317,25 @@ def screen_stocks():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0",port=5000,debug=True)
+
+@app.route("/api/debug/otc/<code>")
+def debug_otc(code):
+    """除錯用：直接回傳 TPEx OpenAPI 原始資料"""
+    code = code.strip().upper()
+    yyyymm = datetime.now().strftime("%Y%m")
+    try:
+        r = requests.get(OTC_HIST, params={"date": yyyymm},
+            headers=OTC_HDR, timeout=10, verify=False)
+        rows = r.json()
+        matched = [row for row in rows if str(row.get("SecuritiesCompanyCode","")).strip()==code]
+        sample = rows[0] if rows else {}
+        return jsonify({
+            "query_code": code, "date": yyyymm,
+            "matched_count": len(matched),
+            "matched_sample": matched[:2],
+            "all_keys": list(sample.keys()) if sample else [],
+            "first_row_sample": sample,
+            "total_rows": len(rows)
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
