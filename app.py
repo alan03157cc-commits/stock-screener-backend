@@ -10,7 +10,11 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 import traceback
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 import time
+
+# 關閉 SSL 警告（TWSE 憑證在某些環境下無法驗證）
 
 app = Flask(__name__)
 CORS(app)
@@ -45,7 +49,7 @@ def get_twse_realtime(code):
     # 先嘗試即時報價
     try:
         url = f"{TWSE_BASE}/stock/realTimeQuotes/list"
-        res = requests.get(url, params={"stockNo": code, "response": "json"}, headers=headers, timeout=10)
+        res = requests.get(url, params={"stockNo": code, "response": "json"}, headers=headers, timeout=10, verify=False)
         data = res.json()
         if data.get("stat") == "OK" and data.get("data"):
             row = data["data"][0]
@@ -73,7 +77,7 @@ def get_twse_realtime(code):
             target = today - timedelta(days=30 * i)
             yyyymm = target.strftime("%Y%m")
             url2 = f"{TWSE_BASE}/stock/historicalDailyQuotes/list"
-            res2 = requests.get(url2, params={"stockNo": code, "date": yyyymm + "01", "response": "json"}, headers=headers, timeout=10)
+            res2 = requests.get(url2, params={"stockNo": code, "date": yyyymm + "01", "response": "json"}, headers=headers, timeout=10, verify=False)
             data2 = res2.json()
             if data2.get("stat") == "OK" and data2.get("data"):
                 rows = data2["data"]
@@ -133,7 +137,7 @@ def get_twse_history(code, days=90):
         headers = {"User-Agent": "Mozilla/5.0"}
         
         try:
-            res = requests.get(url, params=params, headers=headers, timeout=10)
+            res = requests.get(url, params=params, headers=headers, timeout=10, verify=False)
             data = res.json()
             
             if data.get("stat") == "OK" and data.get("data"):
@@ -171,7 +175,7 @@ def get_twse_pe_roe(code):
     headers = {"User-Agent": "Mozilla/5.0"}
     
     try:
-        res = requests.get(url, params=params, headers=headers, timeout=10)
+        res = requests.get(url, params=params, headers=headers, timeout=10, verify=False)
         data = res.json()
         if data.get("stat") == "OK" and data.get("data"):
             row = data["data"][-1]  # 最新一筆
