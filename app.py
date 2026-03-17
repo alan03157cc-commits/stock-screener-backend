@@ -18,6 +18,12 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 app = Flask(__name__)
 CORS(app)
 
+# --- 請在這裡補上這段「首頁」程式碼 ---
+@app.route('/')
+def home():
+    return "選股雷達後端正常運作中！"
+# -----------------------------------
+
 MIS_URL      = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
 HISTORY_URL  = "https://www.twse.com.tw/exchangeReport/STOCK_DAY"
 PE_URL       = "https://www.twse.com.tw/exchangeReport/BWIBBU_d"
