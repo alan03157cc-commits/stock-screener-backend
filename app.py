@@ -36,32 +36,74 @@ def safe_val(val, decimals=2):
 
 def get_twse_realtime(code):
     """
-    取得台股即時（或最近）報價
-    使用 TWSE 官方個股即時行情 API
+    取得台股報價
+    交易時間：使用即時報價 API
+    非交易時間：使用歷史資料 API 取最新收盤價
     """
-    url = f"{TWSE_BASE}/stock/realTimeQuotes/list"
-    params = {"stockNo": code, "response": "json"}
     headers = {"User-Agent": "Mozilla/5.0"}
-    
+
+    # 先嘗試即時報價
     try:
-        res = requests.get(url, params=params, headers=headers, timeout=10)
+        url = f"{TWSE_BASE}/stock/realTimeQuotes/list"
+        res = requests.get(url, params={"stockNo": code, "response": "json"}, headers=headers, timeout=10)
         data = res.json()
         if data.get("stat") == "OK" and data.get("data"):
             row = data["data"][0]
-            # TWSE 欄位：代號、名稱、成交價、漲跌、開盤、最高、最低、昨收、成交量
-            return {
-                "code": row[0].strip(),
-                "name": row[1].strip(),
-                "price": safe_val(row[2]),
-                "change": safe_val(row[3]),
-                "open": safe_val(row[4]),
-                "high": safe_val(row[5]),
-                "low": safe_val(row[6]),
-                "prev_close": safe_val(row[7]),
-                "volume": safe_val(row[8], 0),
-            }
+            price = safe_val(row[2])
+            if price and price > 0:
+                return {
+                    "code": row[0].strip(),
+                    "name": row[1].strip(),
+                    "price": price,
+                    "change": safe_val(row[3]),
+                    "open": safe_val(row[4]),
+                    "high": safe_val(row[5]),
+                    "low": safe_val(row[6]),
+                    "prev_close": safe_val(row[7]),
+                    "volume": safe_val(row[8], 0),
+                }
     except Exception as e:
         print(f"[TWSE realtime error] {code}: {e}")
+
+    # 即時無資料（收盤後）→ 改用歷史 API 取最新收盤
+    try:
+        today = datetime.now()
+        # 嘗試近兩個月，確保能取到資料
+        for i in range(2):
+            target = today - timedelta(days=30 * i)
+            yyyymm = target.strftime("%Y%m")
+            url2 = f"{TWSE_BASE}/stock/historicalDailyQuotes/list"
+            res2 = requests.get(url2, params={"stockNo": code, "date": yyyymm + "01", "response": "json"}, headers=headers, timeout=10)
+            data2 = res2.json()
+            if data2.get("stat") == "OK" and data2.get("data"):
+                rows = data2["data"]
+                # 取最後一筆（最新交易日）
+                last = rows[-1]
+                close = safe_val(last[6])
+                prev_close = safe_val(rows[-2][6]) if len(rows) >= 2 else None
+                name = data2.get("title", "").replace("臺灣證券交易所 股票每日收盤行情", "").strip()
+                # title 格式：「...  股票代號 股票名稱」
+                # 嘗試從 title 取名稱
+                title_parts = data2.get("title", "").split()
+                stock_name = title_parts[-1] if title_parts else code
+
+                if close:
+                    change_pct = round((close - prev_close) / prev_close * 100, 2) if prev_close and prev_close != 0 else None
+                    return {
+                        "code": code,
+                        "name": stock_name,
+                        "price": close,
+                        "change": change_pct,
+                        "open": safe_val(last[3]),
+                        "high": safe_val(last[4]),
+                        "low": safe_val(last[5]),
+                        "prev_close": prev_close,
+                        "volume": safe_val(last[1], 0),
+                    }
+            time.sleep(0.3)
+    except Exception as e:
+        print(f"[TWSE history fallback error] {code}: {e}")
+
     return None
 
 
