@@ -5,14 +5,13 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 import traceback
-import requests  # 引入 requests 準備做偽裝
 
 app = Flask(__name__)
 CORS(app)
 
 @app.route('/')
 def home():
-    return "選股雷達 🚀 (yfinance 引擎運作中：支援上市/上櫃/美股，已開啟防擋機制)"
+    return "選股雷達 🚀 (yfinance 引擎運作中：支援上市/上櫃/美股，自動防擋機制)"
 
 # ===== 技術指標計算區 =====
 def calc_rsi(prices, period=14):
@@ -82,24 +81,18 @@ def fetch_stock_data(code):
     code = str(code).upper().strip()
     is_tw = code.isdigit() # 全數字代表是台股
     
-    # 🌟 建立一個「偽裝成真人瀏覽器」的會話 (Session)，突破 Yahoo 防線
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-    })
-    
     ticker_name = code
     if is_tw:
-        # 台股自動判斷：先試上市 (.TW)，帶入偽裝 session
-        t = yf.Ticker(f"{code}.TW", session=session)
+        # 台股自動判斷：先試上市 (.TW)，不加 session 讓 yfinance 自己處理
+        t = yf.Ticker(f"{code}.TW")
         if t.history(period="1d").empty:
             ticker_name = f"{code}.TWO"
-            t = yf.Ticker(ticker_name, session=session)
+            t = yf.Ticker(ticker_name)
         else:
             ticker_name = f"{code}.TW"
     else:
-        # 美股直接抓，帶入偽裝 session
-        t = yf.Ticker(code, session=session)
+        # 美股直接抓
+        t = yf.Ticker(code)
         
     hist = t.history(period="6mo")
     if hist.empty:
