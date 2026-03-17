@@ -1,6 +1,7 @@
 """
-選股雷達 — Python Flask 後端 v7
-上市用 TWSE，上櫃用 TPEx OpenAPI（更穩定）
+選股雷達 — Python Flask 後端 v8
+上市：TWSE API
+上櫃：TPEx 單一股票 API（不下載全市場資料，速度快）
 """
 
 from flask import Flask, jsonify, request
@@ -18,18 +19,17 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 app = Flask(__name__)
 CORS(app)
 
-MIS_URL   = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
-TSE_HIST  = "https://www.twse.com.tw/exchangeReport/STOCK_DAY"
-TSE_PE    = "https://www.twse.com.tw/exchangeReport/BWIBBU_d"
-# TPEx OpenAPI — 更穩定，無需民國年轉換
-OTC_HIST  = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"
-OTC_PE    = "https://www.tpex.org.tw/web/stock/aftertrading/peratio_analysis/pera_result.php"
+MIS_URL  = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
+TSE_HIST = "https://www.twse.com.tw/exchangeReport/STOCK_DAY"
+TSE_PE   = "https://www.twse.com.tw/exchangeReport/BWIBBU_d"
+# TPEx 單一股票歷史 API（只回傳該股票，速度快）
+OTC_HIST = "https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php"
+OTC_PE   = "https://www.tpex.org.tw/web/stock/aftertrading/peratio_analysis/pera_result.php"
 
-HDR = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-TSE_HDR = {**HDR, "Referer": "https://mis.twse.com.tw/"}
-OTC_HDR = {**HDR, "Referer": "https://www.tpex.org.tw/"}
-
-# ===== 工具 =====
+TSE_HDR = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+           "Referer": "https://mis.twse.com.tw/"}
+OTC_HDR = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+           "Referer": "https://www.tpex.org.tw/"}
 
 def safe(v, d=2):
     if v is None or str(v).strip() in ("", "-", "--", "N/A"):
@@ -43,11 +43,12 @@ def safe(v, d=2):
 # ===== 即時報價 =====
 
 def get_realtime(code):
+    """同時試查上市(tse)與上櫃(otc)，回傳 (market_type, data)"""
     for prefix in ["tse", "otc"]:
         try:
             r = requests.get(MIS_URL,
                 params={"ex_ch": f"{prefix}_{code}.tw", "json": 1, "delay": 0},
-                headers=TSE_HDR, timeout=8, verify=False)
+                headers=TSE_HDR, timeout=6, verify=False)
             msg = r.json().get("msgArray", [])
             if msg and msg[0].get("n"):
                 s = msg[0]
@@ -62,7 +63,7 @@ def get_realtime(code):
                 }
         except Exception as e:
             print(f"[MIS {prefix}] {code}: {e}")
-        time.sleep(0.15)
+        time.sleep(0.1)
     return None, None
 
 # ===== 上市歷史（TWSE）=====
@@ -80,67 +81,38 @@ def tse_history(code, months=5):
                 for row in (data.get("data") or []):
                     c=safe(row[6]); h=safe(row[4]); l=safe(row[5])
                     if c: ac.append(c); ah.append(h or c); al.append(l or c)
-            time.sleep(0.3)
+            time.sleep(0.25)
         except Exception as e:
             print(f"[TSE hist] {code} {d}: {e}")
     ac.reverse(); ah.reverse(); al.reverse()
     return ac, ah, al
 
-# ===== 上櫃歷史（TPEx OpenAPI）=====
+# ===== 上櫃歷史（TPEx 單一股票 API）=====
 
 def otc_history(code, months=5):
     """
-    使用 TPEx OpenAPI 取得上櫃歷史資料
-    每次取一個月，格式：YYYYMM
-    回傳欄位：SecuritiesCompanyCode, Date, Close, Open, High, Low
+    TPEx st43 API：只查指定股票，速度快
+    參數：d=民國年/月（如 114/03），stkno=股票代號
+    回傳 aaData 陣列，欄位：
+      [0]日期 [1]成交張數 [2]成交金額 [3]開盤 [4]最高 [5]最低 [6]收盤 [7]漲跌 [8]筆數
     """
     ac, ah, al = [], [], []
     for i in range(months):
         t = datetime.now() - timedelta(days=30*i)
-        yyyymm = t.strftime("%Y%m")
+        roc_year = t.year - 1911
+        d = f"{roc_year}/{t.month:02d}"
         try:
             r = requests.get(OTC_HIST,
-                params={"date": yyyymm},
-                headers=OTC_HDR, timeout=10, verify=False)
-            rows = r.json()
-            for row in rows:
-                if str(row.get("SecuritiesCompanyCode","")).strip() == code:
-                    c=safe(row.get("Close")); h=safe(row.get("High")); l=safe(row.get("Low"))
-                    if c: ac.append(c); ah.append(h or c); al.append(l or c)
-            time.sleep(0.2)
-        except Exception as e:
-            print(f"[OTC OpenAPI hist] {code} {yyyymm}: {e}")
-
-    # 若 OpenAPI 查不到，退回舊版 API
-    if not ac:
-        ac, ah, al = otc_history_fallback(code, months)
-        return ac, ah, al
-
-    # OpenAPI 資料：每月由舊到新，各月間需要 reverse（先取的是最新月份）
-    # 目前 ac 的順序是：本月資料 + 上月資料 + ... (各月內部由舊到新)
-    # 只需整體 reverse 讓時間序由舊到新
-    ac.reverse(); ah.reverse(); al.reverse()
-    return ac, ah, al
-
-def otc_history_fallback(code, months=5):
-    """TPEx 舊版 API 備援"""
-    ac, ah, al = [], [], []
-    for i in range(months):
-        t = datetime.now()-timedelta(days=30*i)
-        d = f"{t.year-1911}/{t.month:02d}"
-        try:
-            url = "https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php"
-            r = requests.get(url,
-                params={"d":d,"stkno":code,"s":"0,asc,0","l":"zh-tw","o":"json"},
+                params={"d": d, "stkno": code, "s": "0,asc,0", "l": "zh-tw", "o": "json"},
                 headers=OTC_HDR, timeout=8, verify=False)
             rows = r.json().get("aaData") or []
             for row in rows:
-                # 欄位：日期(0)、成交股數(1)、成交金額(2)、開盤(3)、最高(4)、最低(5)、收盤(6)
                 c=safe(row[6]); h=safe(row[4]); l=safe(row[5])
                 if c: ac.append(c); ah.append(h or c); al.append(l or c)
-            time.sleep(0.3)
+            time.sleep(0.25)
         except Exception as e:
-            print(f"[OTC fallback] {code} {d}: {e}")
+            print(f"[OTC hist] {code} {d}: {e}")
+    ac.reverse(); ah.reverse(); al.reverse()
     return ac, ah, al
 
 # ===== 本益比殖利率 =====
@@ -157,7 +129,7 @@ def tse_pe(code, months=5):
                 for row in reversed(data.get("data") or []):
                     pe=safe(row[3]); yld=safe(row[1]); pb=safe(row[5])
                     if pe or yld: return pe, yld, pb
-            time.sleep(0.25)
+            time.sleep(0.2)
         except Exception as e:
             print(f"[TSE PE] {code}: {e}")
     return None, None, None
@@ -174,7 +146,7 @@ def otc_pe(code, months=5):
             for row in reversed(rows):
                 pe=safe(row[1]); yld=safe(row[3]); pb=safe(row[4])
                 if pe or yld: return pe, yld, pb
-            time.sleep(0.25)
+            time.sleep(0.2)
         except Exception as e:
             print(f"[OTC PE] {code}: {e}")
     return None, None, None
@@ -216,13 +188,13 @@ def get_ma_state(p):
 
 def gen_signals(pe,yld,r,m,ms):
     s=[]
-    if m=="bullish":       s.append("MACD黃金交叉")
-    if ms=="all_above":    s.append("多頭排列")
+    if m=="bullish":         s.append("MACD黃金交叉")
+    if ms=="all_above":      s.append("多頭排列")
     elif ms=="golden_cross": s.append("均線交叉")
-    if r and r<30:         s.append("RSI超賣")
-    if yld and yld>=4:     s.append("高殖利率")
-    if pe and pe<12:       s.append("低本益比")
-    if r and 50<r<70:      s.append("強勢區間")
+    if r and r<30:           s.append("RSI超賣")
+    if yld and yld>=4:       s.append("高殖利率")
+    if pe and pe<12:         s.append("低本益比")
+    if r and 50<r<70:        s.append("強勢區間")
     return s[:4]
 
 # ===== 核心查詢 =====
@@ -230,13 +202,16 @@ def gen_signals(pe,yld,r,m,ms):
 def query(code):
     code = code.strip().upper().replace(".TW","").replace(".TWO","")
 
+    # 1. 即時報價，同時確認上市/上櫃
     mtype, rt = get_realtime(code)
 
+    # 2. 歷史資料
     if mtype == "otc":
         cl, hl, ll = otc_history(code)
     elif mtype == "tse":
         cl, hl, ll = tse_history(code)
     else:
+        # 即時查不到（收盤後），試兩個
         cl, hl, ll = tse_history(code)
         if not cl:
             cl, hl, ll = otc_history(code)
@@ -247,15 +222,18 @@ def query(code):
     if not cl:
         return None, f"找不到股票：{code}"
 
+    # 3. 補即時報價
     if not rt:
         price=cl[-1]; prev=cl[-2] if len(cl)>=2 else cl[-1]
         chg=round((price-prev)/prev*100,2) if prev else None
         rt={"name":code,"price":price,"prev_close":prev,"change":chg,
             "open":None,"high":None,"low":None,"volume":None}
 
+    # 4. 本益比殖利率
     time.sleep(0.2)
     pe,yld,pb = otc_pe(code) if mtype=="otc" else tse_pe(code)
 
+    # 5. 技術指標
     r_=calc_rsi(cl) if len(cl)>=15 else None
     m_=calc_macd(cl) if len(cl)>=26 else "unknown"
     k_,d_=calc_kd(hl,ll,cl)
@@ -280,7 +258,8 @@ def query(code):
 
 @app.route("/")
 def index():
-    return jsonify({"status":"ok","message":"選股雷達 v7（上市+上櫃）","time":datetime.now().isoformat()})
+    return jsonify({"status":"ok","message":"選股雷達 v8（上市+上櫃）",
+                    "time":datetime.now().isoformat()})
 
 @app.route("/api/stock/<code>")
 def get_stock(code):
@@ -319,27 +298,37 @@ def screen_stocks():
     return jsonify({"results":results,"total":len(results),
                     "errors":errors,"updated_at":datetime.now().isoformat()})
 
+# ===== 除錯路由 =====
+
+@app.route("/api/debug/mis/<code>")
+def debug_mis(code):
+    code=code.strip().upper()
+    results={}
+    for prefix in ["tse","otc"]:
+        try:
+            r=requests.get(MIS_URL,
+                params={"ex_ch":f"{prefix}_{code}.tw","json":1,"delay":0},
+                headers=TSE_HDR,timeout=6,verify=False)
+            msg=r.json().get("msgArray",[])
+            results[prefix]={"msg_count":len(msg),"first":msg[0] if msg else None}
+        except Exception as e:
+            results[prefix]={"error":str(e)}
+    return jsonify(results)
+
+@app.route("/api/debug/otc_hist/<code>")
+def debug_otc_hist(code):
+    code=code.strip().upper()
+    t=datetime.now(); d=f"{t.year-1911}/{t.month:02d}"
+    try:
+        r=requests.get(OTC_HIST,
+            params={"d":d,"stkno":code,"s":"0,asc,0","l":"zh-tw","o":"json"},
+            headers=OTC_HDR,timeout=8,verify=False)
+        data=r.json()
+        rows=data.get("aaData",[])
+        return jsonify({"date":d,"row_count":len(rows),
+                        "sample":rows[:3],"raw_keys":list(data.keys())})
+    except Exception as e:
+        return jsonify({"error":str(e)}),500
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0",port=5000,debug=True)
-
-@app.route("/api/debug/otc/<code>")
-def debug_otc(code):
-    """除錯用：直接回傳 TPEx OpenAPI 原始資料"""
-    code = code.strip().upper()
-    yyyymm = datetime.now().strftime("%Y%m")
-    try:
-        r = requests.get(OTC_HIST, params={"date": yyyymm},
-            headers=OTC_HDR, timeout=10, verify=False)
-        rows = r.json()
-        matched = [row for row in rows if str(row.get("SecuritiesCompanyCode","")).strip()==code]
-        sample = rows[0] if rows else {}
-        return jsonify({
-            "query_code": code, "date": yyyymm,
-            "matched_count": len(matched),
-            "matched_sample": matched[:2],
-            "all_keys": list(sample.keys()) if sample else [],
-            "first_row_sample": sample,
-            "total_rows": len(rows)
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
