@@ -1,7 +1,7 @@
 """
-選股雷達 — Python Flask 後端 v9
-上市：TWSE API
-上櫃：TPEx API（修正 header 問題）
+選股雷達 — Python Flask 後端 v10
+資料來源：FinMind 開源台股 API（上市+上櫃，免費）
+即時報價：TWSE/TPEx MIS API
 """
 
 from flask import Flask, jsonify, request
@@ -19,24 +19,16 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 app = Flask(__name__)
 CORS(app)
 
-MIS_URL  = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
-TSE_HIST = "https://www.twse.com.tw/exchangeReport/STOCK_DAY"
-TSE_PE   = "https://www.twse.com.tw/exchangeReport/BWIBBU_d"
-OTC_HIST = "https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php"
-OTC_PE   = "https://www.tpex.org.tw/web/stock/aftertrading/peratio_analysis/pera_result.php"
+# FinMind API（不需要 token 可用免費額度）
+FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
+MIS_URL     = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
+TSE_PE      = "https://www.twse.com.tw/exchangeReport/BWIBBU_d"
+OTC_PE_URL  = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis"
 
-TSE_HDR = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0",
-    "Referer": "https://mis.twse.com.tw/",
-    "Accept": "application/json, text/plain, */*",
-}
-OTC_HDR = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0",
-    "Referer": "https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43.php",
-    "Accept": "application/json, text/javascript, */*; q=0.01",
-    "Accept-Language": "zh-TW,zh;q=0.9",
-    "X-Requested-With": "XMLHttpRequest",
-}
+FINMIND_TOKEN = ""  # 留空使用免費額度，或填入您的 token
+HDR = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+       "Accept": "application/json"}
+MIS_HDR = {**HDR, "Referer": "https://mis.twse.com.tw/"}
 
 def safe(v, d=2):
     if v is None or str(v).strip() in ("", "-", "--", "N/A"):
@@ -47,14 +39,14 @@ def safe(v, d=2):
     except Exception:
         return None
 
-# ===== 即時報價 =====
+# ===== 即時報價（MIS）=====
 
 def get_realtime(code):
     for prefix in ["tse", "otc"]:
         try:
             r = requests.get(MIS_URL,
                 params={"ex_ch": f"{prefix}_{code}.tw", "json": 1, "delay": 0},
-                headers=TSE_HDR, timeout=6, verify=False)
+                headers=MIS_HDR, timeout=6, verify=False)
             msg = r.json().get("msgArray", [])
             if msg and msg[0].get("n"):
                 s = msg[0]
@@ -72,61 +64,40 @@ def get_realtime(code):
         time.sleep(0.1)
     return None, None
 
-# ===== 上市歷史 =====
+# ===== FinMind 歷史資料（上市+上櫃都支援）=====
 
-def tse_history(code, months=5):
-    ac, ah, al = [], [], []
-    for i in range(months):
-        d = (datetime.now()-timedelta(days=30*i)).strftime("%Y%m01")
-        try:
-            r = requests.get(TSE_HIST,
-                params={"response":"json","date":d,"stockNo":code},
-                headers=TSE_HDR, timeout=8, verify=False)
-            data = r.json()
-            if data.get("stat") == "OK":
-                for row in (data.get("data") or []):
-                    c=safe(row[6]); h=safe(row[4]); l=safe(row[5])
-                    if c: ac.append(c); ah.append(h or c); al.append(l or c)
-            time.sleep(0.25)
-        except Exception as e:
-            print(f"[TSE hist] {code} {d}: {e}")
-    ac.reverse(); ah.reverse(); al.reverse()
-    return ac, ah, al
-
-# ===== 上櫃歷史 =====
-
-def otc_history(code, months=5):
+def finmind_history(code, months=5):
     """
-    TPEx st43 API，欄位：
-    aaData[i] = [日期, 成交股數, 成交金額, 開盤, 最高, 最低, 收盤, 漲跌, 筆數]
+    FinMind TaiwanStockPrice dataset
+    支援上市與上櫃，同一 API
     """
-    ac, ah, al = [], [], []
-    for i in range(months):
-        t = datetime.now() - timedelta(days=30*i)
-        roc = t.year - 1911
-        d = f"{roc}/{t.month:02d}"
-        try:
-            r = requests.get(OTC_HIST,
-                params={"d": d, "stkno": code, "s": "0,asc,0", "l": "zh-tw", "o": "json"},
-                headers=OTC_HDR, timeout=10, verify=False)
-            # 先看原始回應
-            print(f"[OTC hist] {code} {d} status={r.status_code} len={len(r.text)}")
-            if not r.text.strip():
-                print(f"[OTC hist] 空回應！")
-                time.sleep(0.5)
-                continue
-            data = r.json()
-            rows = data.get("aaData") or []
-            print(f"[OTC hist] {code} {d} rows={len(rows)}")
-            for row in rows:
-                c=safe(row[6]); h=safe(row[4]); l=safe(row[5])
-                if c: ac.append(c); ah.append(h or c); al.append(l or c)
-            time.sleep(0.3)
-        except Exception as e:
-            print(f"[OTC hist error] {code} {d}: {e}")
-            time.sleep(0.3)
-    ac.reverse(); ah.reverse(); al.reverse()
-    return ac, ah, al
+    end   = datetime.now()
+    start = end - timedelta(days=30*months)
+    try:
+        params = {
+            "dataset": "TaiwanStockPrice",
+            "data_id": code,
+            "start_date": start.strftime("%Y-%m-%d"),
+            "end_date":   end.strftime("%Y-%m-%d"),
+        }
+        if FINMIND_TOKEN:
+            params["token"] = FINMIND_TOKEN
+
+        r = requests.get(FINMIND_URL, params=params, headers=HDR, timeout=15)
+        data = r.json()
+        rows = data.get("data", [])
+        if not rows:
+            return [], [], []
+
+        # 欄位：date, stock_id, Trading_Volume, Trading_money,
+        #        open, max, min, close, spread, Trading_turnover
+        cl = [safe(row["close"]) for row in rows if safe(row.get("close"))]
+        hl = [safe(row["max"])   for row in rows if safe(row.get("max"))]
+        ll = [safe(row["min"])   for row in rows if safe(row.get("min"))]
+        return cl, hl, ll
+    except Exception as e:
+        print(f"[FinMind hist] {code}: {e}")
+        return [], [], []
 
 # ===== 本益比殖利率 =====
 
@@ -136,7 +107,7 @@ def tse_pe(code, months=5):
         try:
             r = requests.get(TSE_PE,
                 params={"response":"json","date":d,"stockNo":code},
-                headers=TSE_HDR, timeout=8, verify=False)
+                headers=MIS_HDR, timeout=8, verify=False)
             data = r.json()
             if data.get("stat") == "OK":
                 for row in reversed(data.get("data") or []):
@@ -147,23 +118,26 @@ def tse_pe(code, months=5):
             print(f"[TSE PE] {code}: {e}")
     return None, None, None
 
-def otc_pe(code, months=5):
-    for i in range(months):
-        t = datetime.now()-timedelta(days=30*i)
-        d = f"{t.year-1911}/{t.month:02d}"
-        try:
-            r = requests.get(OTC_PE,
-                params={"d":d,"stkno":code,"l":"zh-tw","o":"json"},
-                headers=OTC_HDR, timeout=8, verify=False)
-            if not r.text.strip():
-                time.sleep(0.3); continue
-            rows = r.json().get("aaData") or []
-            for row in reversed(rows):
-                pe=safe(row[1]); yld=safe(row[3]); pb=safe(row[4])
-                if pe or yld: return pe, yld, pb
-            time.sleep(0.2)
-        except Exception as e:
-            print(f"[OTC PE] {code}: {e}")
+def otc_pe_finmind(code):
+    """用 FinMind 取上櫃本益比（TaiwanStockPER dataset）"""
+    try:
+        end   = datetime.now()
+        start = end - timedelta(days=90)
+        params = {
+            "dataset": "TaiwanStockPER",
+            "data_id": code,
+            "start_date": start.strftime("%Y-%m-%d"),
+            "end_date":   end.strftime("%Y-%m-%d"),
+        }
+        if FINMIND_TOKEN:
+            params["token"] = FINMIND_TOKEN
+        r = requests.get(FINMIND_URL, params=params, headers=HDR, timeout=10)
+        rows = r.json().get("data", [])
+        if rows:
+            last = rows[-1]
+            return safe(last.get("PER")), safe(last.get("DividendYield")), safe(last.get("PBR"))
+    except Exception as e:
+        print(f"[FinMind PER] {code}: {e}")
     return None, None, None
 
 # ===== 技術指標 =====
@@ -216,31 +190,34 @@ def gen_signals(pe,yld,r,m,ms):
 
 def query(code):
     code = code.strip().upper().replace(".TW","").replace(".TWO","")
+
+    # 1. 即時報價，同時判斷上市/上櫃
     mtype, rt = get_realtime(code)
 
-    if mtype == "otc":
-        cl, hl, ll = otc_history(code)
-    elif mtype == "tse":
-        cl, hl, ll = tse_history(code)
-    else:
-        cl, hl, ll = tse_history(code)
-        if not cl:
-            cl, hl, ll = otc_history(code)
-            mtype = "otc" if cl else None
-        else:
-            mtype = "tse"
+    # 2. 歷史資料（FinMind 上市上櫃通用）
+    cl, hl, ll = finmind_history(code)
 
     if not cl:
-        return None, f"找不到股票：{code}"
+        return None, f"找不到股票：{code}，請確認是否為台股上市/上櫃代號"
 
+    # 3. 補即時報價
     if not rt:
         price=cl[-1]; prev=cl[-2] if len(cl)>=2 else cl[-1]
         chg=round((price-prev)/prev*100,2) if prev else None
         rt={"name":code,"price":price,"prev_close":prev,"change":chg,
             "open":None,"high":None,"low":None,"volume":None}
 
-    time.sleep(0.2)
-    pe,yld,pb = otc_pe(code) if mtype=="otc" else tse_pe(code)
+    # 4. 本益比殖利率
+    if mtype == "otc" or (mtype is None and code.startswith("6") or code.startswith("8")):
+        pe,yld,pb = otc_pe_finmind(code)
+        if not pe and not yld:
+            pe,yld,pb = tse_pe(code)
+    else:
+        pe,yld,pb = tse_pe(code)
+        if not pe and not yld:
+            pe,yld,pb = otc_pe_finmind(code)
+
+    # 5. 技術指標
     r_=calc_rsi(cl) if len(cl)>=15 else None
     m_=calc_macd(cl) if len(cl)>=26 else "unknown"
     k_,d_=calc_kd(hl,ll,cl)
@@ -265,7 +242,7 @@ def query(code):
 
 @app.route("/")
 def index():
-    return jsonify({"status":"ok","message":"選股雷達 v9","time":datetime.now().isoformat()})
+    return jsonify({"status":"ok","message":"選股雷達 v10（FinMind）","time":datetime.now().isoformat()})
 
 @app.route("/api/stock/<code>")
 def get_stock(code):
@@ -298,28 +275,11 @@ def screen_stocks():
                 "cap":"large","foreign_days":None,"invest":None,"margin_pct":None,
                 "signals":data["signals"],
             })
-            time.sleep(0.8)
+            time.sleep(0.5)
         except Exception as e:
             errors.append(code); print(f"[ERR]{code}:{e}")
     return jsonify({"results":results,"total":len(results),
                     "errors":errors,"updated_at":datetime.now().isoformat()})
-
-@app.route("/api/debug/otc_hist/<code>")
-def debug_otc_hist(code):
-    code=code.strip().upper()
-    t=datetime.now(); roc=t.year-1911; d=f"{roc}/{t.month:02d}"
-    try:
-        r=requests.get(OTC_HIST,
-            params={"d":d,"stkno":code,"s":"0,asc,0","l":"zh-tw","o":"json"},
-            headers=OTC_HDR,timeout=10,verify=False)
-        return jsonify({
-            "status_code":r.status_code,
-            "content_length":len(r.text),
-            "first_100_chars":r.text[:100],
-            "parsed": r.json() if r.text.strip() else "空回應"
-        })
-    except Exception as e:
-        return jsonify({"error":str(e),"raw":r.text[:200] if 'r' in dir() else "no response"}),500
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0",port=5000,debug=True)
